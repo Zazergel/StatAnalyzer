@@ -1,0 +1,649 @@
+package org.zazergel.statanalyzer.view;
+
+import com.vaadin.flow.component.AttachEvent;
+import com.vaadin.flow.component.UI;
+import com.vaadin.flow.component.button.Button;
+import com.vaadin.flow.component.dependency.Uses;
+import com.vaadin.flow.component.dialog.Dialog;
+import com.vaadin.flow.component.grid.Grid;
+import com.vaadin.flow.component.grid.GridVariant;
+import com.vaadin.flow.component.html.Div;
+import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.icon.Icon;
+import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
+import com.vaadin.flow.component.orderedlayout.VerticalLayout;
+import com.vaadin.flow.component.tabs.Tab;
+import com.vaadin.flow.component.tabs.Tabs;
+import com.vaadin.flow.component.tabs.TabsVariant;
+import com.vaadin.flow.data.renderer.ComponentRenderer;
+import com.vaadin.flow.data.renderer.LitRenderer;
+import com.vaadin.flow.data.renderer.Renderer;
+import com.vaadin.flow.dom.ThemeList;
+import com.vaadin.flow.router.Route;
+import com.vaadin.flow.theme.lumo.Lumo;
+import jakarta.annotation.PreDestroy;
+import org.zazergel.statanalyzer.service.IngestService;
+import org.zazergel.statanalyzer.service.StatisticsService;
+import org.zazergel.statanalyzer.service.TooltipService;
+import org.zazergel.statanalyzer.util.SqlUtils;
+import org.zazergel.statanalyzer.view.components.ChartDialog;
+import org.zazergel.statanalyzer.view.components.TimelineComponent;
+import org.zazergel.statanalyzer.view.components.UploadToolbar;
+
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Route("")
+@Uses(Icon.class)
+@Uses(Span.class)
+public class MainView extends VerticalLayout {
+
+    private final StatisticsService statisticsService;
+    private final TooltipService tooltipService;
+
+    private final UploadToolbar toolbar;
+    private final TimelineComponent timeline;
+
+    private final Grid<Map<String, Object>> activityGrid = new Grid<>();
+    private final Grid<Map<String, Object>> locksGrid = new Grid<>();
+    private final Grid<Map<String, Object>> rootCauseGrid = new Grid<>();
+
+    private final Tab tabActivity = new Tab("Activity");
+    private final Tab tabLocks = new Tab("Locks");
+    private final Tab tabAnalysis = new Tab("Root Cause Analysis");
+    private final Tabs tabs = new Tabs(tabActivity, tabLocks, tabAnalysis);
+
+    private final HorizontalLayout statsPanel = new HorizontalLayout();
+    private Integer currentSnapshotId = null;
+    private Map<String, Object> lastLoadedSnapshot = null;
+    private String currentSearchFilter = "";
+
+    private List<Map<String, Object>> currentActivityData = List.of();
+    private List<Map<String, Object>> currentLocksData = List.of();
+
+    private String activeStateFilter = null;
+    private String activeLockFilter = null;
+
+    public MainView(IngestService ingestService,
+                    StatisticsService statisticsService,
+                    TooltipService tooltipService) {
+        this.statisticsService = statisticsService;
+        this.tooltipService = tooltipService;
+
+        setSizeFull();
+        setPadding(false);
+        setSpacing(false);
+        setMargin(false);
+        getStyle().set("overflow", "hidden");
+
+        configureGrids();
+
+        this.toolbar = new UploadToolbar(
+                ingestService,
+                this::refreshAll,
+                this::clearData,
+                () -> new ChartDialog(statisticsService.getChartData()).open(),
+                this::toggleTheme,
+                this::onSearch,
+                this::onTimezoneChanged
+        );
+
+        this.timeline = new TimelineComponent(this::loadSnapshotDetails);
+
+        VerticalLayout workspace = createWorkspace();
+        add(toolbar, workspace);
+        expand(workspace);
+
+        refreshAll();
+    }
+
+    private void clearData() {
+        statisticsService.clearAllData();
+        refreshAll();
+    }
+
+    private void toggleTheme() {
+        ThemeList themeList = UI.getCurrent().getElement().getThemeList();
+        if (themeList.contains(Lumo.DARK)) {
+            themeList.remove(Lumo.DARK);
+        } else {
+            themeList.add(Lumo.DARK);
+        }
+    }
+
+    private void onSearch(String filter) {
+        this.currentSearchFilter = filter;
+        refreshAll();
+    }
+
+    private void onTimezoneChanged(Integer offset) {
+        if (activityGrid.isVisible()) {
+            activityGrid.getDataProvider().refreshAll();
+        }
+        if (rootCauseGrid.isVisible()) {
+            rootCauseGrid.getDataProvider().refreshAll();
+        }
+    }
+
+    private void refreshAll() {
+        List<Map<String, Object>> snapshots = statisticsService.getSnapshots(currentSearchFilter);
+        timeline.update(snapshots);
+
+        boolean isSearchActive = currentSearchFilter != null && !currentSearchFilter.isBlank();
+
+        boolean hasAnyData = isSearchActive || (snapshots != null && !snapshots.isEmpty());
+
+        toolbar.setDataLoadedState(hasAnyData);
+
+        if (lastLoadedSnapshot != null && Objects.requireNonNull(snapshots).stream().anyMatch(s -> s.get("id").equals(lastLoadedSnapshot.get("id")))) {
+            loadSnapshotDetails(lastLoadedSnapshot);
+        } else if (!(snapshots != null && snapshots.isEmpty())) {
+            loadSnapshotDetails(Objects.requireNonNull(snapshots).getFirst());
+        } else {
+            this.currentSnapshotId = null;
+            this.activeStateFilter = null;
+            this.activeLockFilter = null;
+
+            activityGrid.setItems(List.of());
+            locksGrid.setItems(List.of());
+            rootCauseGrid.setItems(List.of());
+
+            tabActivity.setLabel("Activity (0)");
+            tabLocks.setLabel("Locks (0)");
+            tabAnalysis.setLabel("Root Cause Analysis (0)");
+
+            currentActivityData = List.of();
+            currentLocksData = List.of();
+
+            if (!hasAnyData) {
+                manageTabsVisibility(true, false, false);
+            } else {
+                manageTabsVisibility(true, true, true);
+            }
+
+            updateGridVisibility();
+            updateStatsPanel();
+        }
+    }
+
+    private VerticalLayout createWorkspace() {
+        tabs.addThemeVariants(TabsVariant.LUMO_SMALL);
+        tabs.addSelectedChangeListener(e -> {
+            updateGridVisibility();
+            updateStatsPanel();
+        });
+
+        statsPanel.setSpacing(true);
+        statsPanel.setAlignItems(Alignment.CENTER);
+
+        HorizontalLayout header = new HorizontalLayout(tabs, statsPanel);
+        header.setWidthFull();
+        header.setJustifyContentMode(JustifyContentMode.BETWEEN);
+        header.getStyle().set("border-bottom", "1px solid var(--lumo-contrast-10pct)");
+
+        VerticalLayout content = new VerticalLayout(activityGrid, locksGrid, rootCauseGrid);
+        content.setSizeFull();
+        content.setPadding(false);
+        content.setSpacing(false);
+
+        VerticalLayout topPane = new VerticalLayout(header, content);
+        topPane.setSizeFull();
+        topPane.setPadding(true);
+        topPane.getStyle().set("padding-bottom", "0");
+
+        VerticalLayout workspace = new VerticalLayout(topPane, timeline);
+        workspace.setSizeFull();
+        workspace.setPadding(false);
+        workspace.setSpacing(false);
+        workspace.expand(topPane);
+
+        return workspace;
+    }
+
+    private void updateGridVisibility() {
+        activityGrid.setVisible(tabs.getSelectedTab().equals(tabActivity));
+        locksGrid.setVisible(tabs.getSelectedTab().equals(tabLocks));
+        rootCauseGrid.setVisible(tabs.getSelectedTab().equals(tabAnalysis));
+    }
+
+    private void loadSnapshotDetails(Map<String, Object> snapshot) {
+        if (snapshot == null) return;
+        Integer snapId = (Integer) snapshot.get("id");
+
+        if (!Objects.equals(snapId, this.currentSnapshotId)) {
+            this.activeStateFilter = null;
+            this.activeLockFilter = null;
+        }
+
+        this.currentSnapshotId = snapId;
+        this.lastLoadedSnapshot = snapshot;
+        long lockCount = ((Number) snapshot.get("lock_cnt")).longValue();
+
+        this.currentActivityData = statisticsService.getActivity(snapId, currentSearchFilter);
+        this.currentLocksData = lockCount > 0 ? statisticsService.getLocks(snapId, currentSearchFilter) : List.of();
+        List<Map<String, Object>> rootCauseData = lockCount > 0 ? statisticsService.getRootCause(snapId, currentSearchFilter) : List.of();
+
+        tabActivity.setLabel("Activity (" + currentActivityData.size() + ")");
+        tabLocks.setLabel("Locks (" + currentLocksData.size() + ")");
+        tabAnalysis.setLabel("Root Cause Analysis (" + rootCauseData.size() + ")");
+
+        manageTabsVisibility(!currentActivityData.isEmpty(), !currentLocksData.isEmpty(), !rootCauseData.isEmpty());
+
+        updateActivityGridItems();
+        updateLocksGridItems();
+
+        rootCauseGrid.setItems(rootCauseData);
+
+        updateGridVisibility();
+        updateStatsPanel();
+    }
+
+    private void manageTabsVisibility(boolean hasAct, boolean hasLocks, boolean hasRoot) {
+        if (currentSearchFilter != null && !currentSearchFilter.isBlank()) {
+            tabActivity.setVisible(hasAct);
+            tabLocks.setVisible(hasLocks);
+            tabAnalysis.setVisible(hasRoot);
+        } else {
+            tabActivity.setVisible(true);
+            tabLocks.setVisible(hasLocks);
+            tabAnalysis.setVisible(hasLocks);
+        }
+
+        if (!tabs.getSelectedTab().isVisible()) {
+            if (tabActivity.isVisible()) tabs.setSelectedTab(tabActivity);
+            else if (tabLocks.isVisible()) tabs.setSelectedTab(tabLocks);
+        }
+    }
+
+    private void updateStatsPanel() {
+        statsPanel.removeAll();
+        if (tabs.getSelectedTab().equals(tabActivity)) {
+            Map<String, Long> counts = currentActivityData.stream()
+                    .collect(Collectors.groupingBy(r -> (String) r.getOrDefault("state", "unknown"), Collectors.counting()));
+
+            counts.entrySet().stream()
+                    .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                    .forEach(e -> addBadge(
+                            e.getKey(),
+                            e.getValue(),
+                            getThemeForState(e.getKey()),
+                            () -> handleStateFilter(e.getKey()),
+                            e.getKey().equals(activeStateFilter)
+                    ));
+
+        } else if (tabs.getSelectedTab().equals(tabLocks)) {
+            Map<String, Long> counts = currentLocksData.stream()
+                    .map(r -> (String) r.getOrDefault("locking_mode", ""))
+                    .filter(s -> s != null && !s.isBlank())
+                    .flatMap(s -> Arrays.stream(s.split(",")))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.groupingBy(s -> s, Collectors.counting()));
+
+            counts.entrySet().stream()
+                    .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                    .forEach(e -> addBadge(
+                            e.getKey(),
+                            e.getValue(),
+                            getThemeForLock(e.getKey()),
+                            () -> handleLockFilter(e.getKey()),
+                            e.getKey().equals(activeLockFilter)
+                    ));
+        }
+    }
+
+    private void addBadge(String label, Long count, String theme, Runnable onClick, boolean isActive) {
+        Span badge = new Span(label + ": " + count);
+        applyBadgeStyle(badge, theme);
+        badge.getStyle().set("cursor", "pointer");
+
+        if (isActive) {
+            badge.getStyle().set("box-shadow", "0 0 0 2px var(--lumo-primary-color)");
+        }
+
+        badge.addClickListener(e -> onClick.run());
+        statsPanel.add(badge);
+    }
+
+    private void applyBadgeStyle(Span badge, String theme) {
+        badge.getStyle()
+                .set("display", "inline-flex")
+                .set("align-items", "center")
+                .set("box-sizing", "border-box")
+                .set("padding", "0.125em 0.25em")
+                .set("border-radius", "var(--lumo-border-radius-m)")
+                .set("font-size", "var(--lumo-font-size-xs)")
+                .set("line-height", "1")
+                .set("font-weight", "500");
+        switch (theme == null ? "" : theme) {
+            case "success" -> badge.getStyle()
+                    .set("background-color", "var(--lumo-success-color-10pct)")
+                    .set("color", "var(--lumo-success-text-color)");
+            case "error" -> badge.getStyle()
+                    .set("background-color", "var(--lumo-error-color-10pct)")
+                    .set("color", "var(--lumo-error-text-color)");
+            case "contrast" -> badge.getStyle()
+                    .set("background-color", "var(--lumo-contrast-20pct)")
+                    .set("color", "var(--lumo-body-text-color)");
+            default -> badge.getStyle()
+                    .set("background-color", "var(--lumo-contrast-10pct)")
+                    .set("color", "var(--lumo-body-text-color)");
+        }
+    }
+
+    private void handleStateFilter(String state) {
+        if (state.equals(activeStateFilter)) {
+            activeStateFilter = null;
+        } else {
+            activeStateFilter = state;
+        }
+        updateActivityGridItems();
+        updateStatsPanel();
+    }
+
+    private void handleLockFilter(String mode) {
+        if (mode.equals(activeLockFilter)) {
+            activeLockFilter = null;
+        } else {
+            activeLockFilter = mode;
+        }
+        updateLocksGridItems();
+        updateStatsPanel();
+    }
+
+    private void updateActivityGridItems() {
+        if (currentActivityData == null) return;
+
+        if (activeStateFilter == null) {
+            activityGrid.setItems(currentActivityData);
+        } else {
+            List<Map<String, Object>> filtered = currentActivityData.stream()
+                    .filter(row -> activeStateFilter.equals(row.get("state")))
+                    .toList();
+            activityGrid.setItems(filtered);
+        }
+    }
+
+    private void updateLocksGridItems() {
+        if (currentLocksData == null) return;
+
+        if (activeLockFilter == null) {
+            locksGrid.setItems(currentLocksData);
+        } else {
+            List<Map<String, Object>> filtered = currentLocksData.stream()
+                    .filter(row -> {
+                        String modes = (String) row.get("locking_mode");
+                        if (modes == null) return false;
+                        return Arrays.stream(modes.split(","))
+                                .map(String::trim)
+                                .anyMatch(s -> s.equals(activeLockFilter));
+                    })
+                    .toList();
+            locksGrid.setItems(filtered);
+        }
+    }
+
+    private String getThemeForState(String state) {
+        if (state == null) return "";
+        String s = state.toLowerCase();
+
+        if (s.contains("idle in transaction")) return "error";
+        if (s.contains("idle")) return "contrast";
+        if (s.contains("active")) return "success";
+        return "";
+    }
+
+    private String getThemeForLock(String mode) {
+        if (mode == null) return "";
+        String m = mode.toLowerCase();
+        if (m.contains("exclusive")) return "error";
+        if (m.contains("share")) return "contrast";
+        return "";
+    }
+
+    private void configureGrids() {
+        configureActivityGrid();
+        configureLocksGrid();
+        configureRootCauseGrid();
+    }
+
+    private void configureActivityGrid() {
+        activityGrid.setSizeFull();
+        activityGrid.addThemeVariants(GridVariant.LUMO_COMPACT, GridVariant.LUMO_ROW_STRIPES);
+
+        activityGrid.addColumn(createSimpleHighlightRenderer("pid")).setHeader("PID")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(new ComponentRenderer<>(row -> {
+                    String state = (String) row.get("state");
+                    if (state == null || state.isBlank()) return new Span();
+                    Span badge = new Span(state);
+                    applyBadgeStyle(badge, getThemeForState(state));
+                    badge.getElement().setAttribute("title", tooltipService.getStateTooltip(state));
+                    return badge;
+                })).setHeader("State")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(r -> formatTime(r.get("xact_start"))).setHeader("Tx Start")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+        activityGrid.addColumn(r -> extractAppParam((String) r.get("application_name"), "Time")).setHeader("Java Start")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+        activityGrid.addColumn(r -> extractAppParam((String) r.get("application_name"), "ID")).setHeader("Thread ID")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(new ComponentRenderer<>(row -> {
+                    String evt = (String) row.get("wait_event");
+                    if (evt == null || evt.isBlank()) return new Span();
+                    Span badge = new Span(evt);
+                    applyBadgeStyle(badge, "contrast");
+                    badge.getElement().setAttribute("title", tooltipService.getWaitEventTooltip(evt));
+                    return badge;
+                })).setHeader("Wait Event")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(createHighlightRenderer("query")).setHeader("Query")
+                .setFlexGrow(1).setResizable(true);
+
+        activityGrid.addItemDoubleClickListener(e -> showQueryDialog((String) e.getItem().get("query"), null));
+    }
+
+    private void configureLocksGrid() {
+        locksGrid.setSizeFull();
+        locksGrid.addThemeVariants(GridVariant.LUMO_COMPACT, GridVariant.LUMO_ROW_STRIPES);
+
+        locksGrid.addColumn(createSimpleHighlightRenderer("waiting_pid")).setHeader("Waiting PID")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+        locksGrid.addColumn(createSimpleHighlightRenderer("locking_pid")).setHeader("Locking PID")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        locksGrid.addColumn(new ComponentRenderer<>(row -> {
+                    String rawModes = (String) row.get("locking_mode");
+                    if (rawModes == null || rawModes.isBlank()) return new Span();
+                    Div container = new Div();
+                    container.getStyle().set("display", "flex");
+                    container.getStyle().set("flex-wrap", "wrap");
+                    container.getStyle().set("gap", "4px");
+
+                    for (String mode : rawModes.split(",")) {
+                        mode = mode.trim();
+                        if (mode.isEmpty()) continue;
+                        Span badge = new Span(mode);
+                        applyBadgeStyle(badge, getThemeForLock(mode));
+                        badge.getElement().setAttribute("title", tooltipService.getLockTooltip(mode));
+                        container.add(badge);
+                    }
+                    return container;
+                })).setHeader("Lock Mode")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        locksGrid.addColumn(createHighlightRenderer("waiting_query")).setHeader("Waiting Query")
+                .setFlexGrow(1).setResizable(true);
+        locksGrid.addColumn(createHighlightRenderer("locking_query")).setHeader("Locking Query")
+                .setFlexGrow(1).setResizable(true);
+
+        locksGrid.addItemDoubleClickListener(e -> showQueryDialog((String) e.getItem().get("waiting_query"), (String) e.getItem().get("locking_query")));
+    }
+
+    private void configureRootCauseGrid() {
+        rootCauseGrid.setSizeFull();
+        rootCauseGrid.addThemeVariants(GridVariant.LUMO_COMPACT, GridVariant.LUMO_ROW_STRIPES);
+
+        rootCauseGrid.addColumn(createSimpleHighlightRenderer("locking_pid")).setHeader("Root PID")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+        rootCauseGrid.addColumn(r -> r.get("cnt")).setHeader("Victims")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+        rootCauseGrid.addColumn(createHighlightRenderer("query")).setHeader("Root Query")
+                .setFlexGrow(1).setResizable(true);
+
+        rootCauseGrid.setItemDetailsRenderer(new ComponentRenderer<>(() -> {
+            VerticalLayout d = new VerticalLayout();
+            d.setPadding(true);
+            d.getStyle().set("background-color", "var(--lumo-contrast-5pct)");
+            return d;
+        }, (layout, rootRow) -> {
+            layout.removeAll();
+            Integer pid = (Integer) rootRow.get("locking_pid");
+            if (pid != null && currentSnapshotId != null) {
+                List<Map<String, Object>> v = statisticsService.getVictims(pid, currentSnapshotId, currentSearchFilter);
+                if (v.isEmpty()) layout.add(new Span("Нет данных"));
+                else {
+                    Grid<Map<String, Object>> g = new Grid<>();
+                    g.addThemeVariants(GridVariant.LUMO_COMPACT);
+
+                    g.addColumn(createSimpleHighlightRenderer("waiting_pid")).setHeader("PID").setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+                    g.addColumn(row -> formatTime(row.get("xact_start"))).setHeader("Tx Start")
+                            .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+                    g.addColumn(row -> extractAppParam((String) row.get("application_name"), "Time")).setHeader("Java Start")
+                            .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+                    g.addColumn(row -> extractAppParam((String) row.get("application_name"), "ID")).setHeader("Thread ID")
+                            .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+                    g.addColumn(row -> row.get("wait_event")).setHeader("Wait").setAutoWidth(true).setFlexGrow(0).setResizable(true);
+                    g.addColumn(createHighlightRenderer("waiting_query")).setHeader("Query").setFlexGrow(1).setResizable(true);
+
+                    g.setItems(v);
+                    g.setHeight("250px");
+                    layout.add(g);
+                }
+            }
+        }));
+
+        rootCauseGrid.addItemClickListener(e -> rootCauseGrid.setDetailsVisible(e.getItem(), !rootCauseGrid.isDetailsVisible(e.getItem())));
+    }
+
+    /**
+     * Новый рендерер для простой подсветки текста/чисел, не прибегающий к SQL парсеру
+     */
+    private Renderer<Map<String, Object>> createSimpleHighlightRenderer(String key) {
+        return LitRenderer.<Map<String, Object>>of("<span .innerHTML='${item.htmlContent}'></span>")
+                .withProperty("htmlContent", row -> {
+                    String val = row.get(key) != null ? String.valueOf(row.get(key)) : "";
+
+                    String safeVal = val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                    if (currentSearchFilter != null && !currentSearchFilter.isBlank() && val.toLowerCase().contains(currentSearchFilter.toLowerCase())) {
+                        String safeFilter = currentSearchFilter.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                        String regex = "(?i)(" + java.util.regex.Pattern.quote(safeFilter) + ")";
+                        return safeVal.replaceAll(regex, "<mark>$1</mark>");
+                    }
+                    return safeVal;
+                });
+    }
+
+
+    private Renderer<Map<String, Object>> createHighlightRenderer(String key) {
+        return LitRenderer.<Map<String, Object>>of(
+                "<span style='font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; font-size: 12px;' .innerHTML='${item.htmlContent}'></span>"
+        ).withProperty("htmlContent", row -> {
+            String val = row.get(key) != null ? row.get(key).toString() : "";
+            return SqlUtils.highlightHtml(val, true, currentSearchFilter);
+        });
+    }
+
+    private String formatTime(Object tsObj) {
+        if (tsObj == null) return "";
+        try {
+            long millis = ((Timestamp) tsObj).getTime();
+            int offset = toolbar.getTimezoneOffset() != null ? toolbar.getTimezoneOffset() : 0;
+            return Instant.ofEpochMilli(millis).atZone(ZoneOffset.UTC)
+                    .plusHours(offset).format(DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private String extractAppParam(String appName, String key) {
+        if (appName == null || appName.isBlank()) return "";
+        Matcher m = Pattern.compile("(?i)" + key + ":(\\S+)").matcher(appName);
+        if (m.find()) {
+            String val = m.group(1);
+            if ("Time".equalsIgnoreCase(key) && val.matches("\\d{10,}")) {
+                try {
+                    long millis = Long.parseLong(val);
+                    int offset = toolbar.getTimezoneOffset() != null ? toolbar.getTimezoneOffset() : 0;
+                    return Instant.ofEpochMilli(millis).atOffset(ZoneOffset.ofHours(offset))
+                            .format(DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
+                } catch (Exception e) {
+                    return val;
+                }
+            }
+            return val;
+        }
+        return "";
+    }
+
+    private void showQueryDialog(String sql1, String sql2) {
+        Dialog d = new Dialog();
+        d.setHeaderTitle("Query Details");
+        d.setWidth("80vw");
+        d.setHeight("80vh");
+
+        if (sql2 == null) {
+            d.add(createQueryLayout(sql1));
+        } else {
+            Tabs t = new Tabs(new Tab("Blocked"), new Tab("Locking"));
+            VerticalLayout v1 = createQueryLayout(sql1);
+            VerticalLayout v2 = createQueryLayout(sql2);
+            v2.setVisible(false);
+
+            t.addSelectedChangeListener(e -> {
+                v1.setVisible(t.getSelectedIndex() == 0);
+                v2.setVisible(t.getSelectedIndex() == 1);
+            });
+
+            d.add(t, v1, v2);
+        }
+        d.getFooter().add(new Button("Close", e -> d.close()));
+        d.open();
+    }
+
+    private VerticalLayout createQueryLayout(String sql) {
+        Span c = new Span();
+        c.getElement().setProperty("innerHTML", SqlUtils.highlightHtml(SqlUtils.prettifySql(sql), true, null));
+        c.getStyle().set("white-space", "pre-wrap").set("font-family", "monospace").set("padding", "10px");
+
+        VerticalLayout s = new VerticalLayout(c);
+        s.setSizeFull();
+        s.getStyle().set("overflow", "auto");
+        return s;
+    }
+
+    @Override
+    protected void onAttach(AttachEvent attachEvent) {
+        super.onAttach(attachEvent);
+        UI.getCurrent().getPage().executeJs("const u=document.querySelector('vaadin-upload'); if(u) u.shadowRoot.querySelector('vaadin-upload-file-list').style.display='none'");
+    }
+
+    @PreDestroy
+    public void destroy() {
+        if (toolbar != null) toolbar.shutdown();
+    }
+}
