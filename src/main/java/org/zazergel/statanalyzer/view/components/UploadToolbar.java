@@ -188,9 +188,12 @@ public class UploadToolbar extends FlexLayout {
         return currentTimezoneOffset;
     }
 
+    /**
+     * Обновляет список файлов, скрывая скрытые директории.
+     */
     private void openVaadinDirectoryChooser() {
         Dialog dialog = new Dialog();
-        dialog.setHeaderTitle("Выберите папку с логами или архив");
+        dialog.setHeaderTitle("Выберите папку с данными или архив");
         dialog.setWidth("700px");
         dialog.setHeight("80vh");
         dialog.setResizable(true);
@@ -223,7 +226,8 @@ public class UploadToolbar extends FlexLayout {
             if (!dir.exists() || !dir.isDirectory()) return;
 
             File[] files = dir.listFiles(f ->
-                    f.isDirectory() || f.getName().endsWith(".zip") || f.getName().endsWith(".csv") || f.getName().endsWith(".txt")
+                    !f.getName().startsWith(".") &&
+                            (f.isDirectory() || f.getName().endsWith(".zip") || f.getName().endsWith(".csv") || f.getName().endsWith(".txt"))
             );
 
             List<FileItem> items = new ArrayList<>();
@@ -286,9 +290,20 @@ public class UploadToolbar extends FlexLayout {
         dialog.open();
     }
 
+    /**
+     * Обрабатывает загрузку файлов.
+     *
+     * @param path путь
+     */
     private void handleLocalUpload(String path) {
         if (path == null || path.isBlank()) {
             return;
+        }
+
+        if (path.toLowerCase().endsWith(".zip")) {
+            if (!validateZip(path)) {
+                return;
+            }
         }
 
         UI ui = UI.getCurrent();
@@ -347,6 +362,106 @@ public class UploadToolbar extends FlexLayout {
                 });
             }
         });
+    }
+
+    /**
+     * Проверяет валидность содержимого ZIP архива.
+     *
+     * @param path путь к архиву
+     * @return статус валидации
+     */
+    private boolean validateZip(String path) {
+        File file = new File(path);
+        if (!file.exists() || !file.isFile()) return true;
+
+        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(file)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            boolean hasCsv = false;
+            boolean hasTxt = false;
+            boolean hasStatCsv = false;
+            boolean hasLocksCsv = false;
+            boolean hasOtherFiles = false;
+            boolean isEmpty = true;
+
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                if (entry.isDirectory() || entry.getName().startsWith("__MACOSX") || entry.getName().startsWith(".")) {
+                    continue;
+                }
+                isEmpty = false;
+                String name = new File(entry.getName()).getName().toLowerCase();
+
+                if (name.endsWith(".csv")) {
+                    hasCsv = true;
+                    if (name.contains("stat")) hasStatCsv = true;
+                    else if (name.contains("lock")) hasLocksCsv = true;
+                    else hasOtherFiles = true;
+                } else if (name.endsWith(".txt")) {
+                    hasTxt = true;
+                    if (!name.contains("stat") && !name.contains("lock")) {
+                        hasOtherFiles = true;
+                    }
+                } else {
+                    hasOtherFiles = true;
+                }
+            }
+
+            if (isEmpty) {
+                showValidationWarning("Архив пуст или не содержит подходящих данных.");
+                return false;
+            }
+
+            if (hasOtherFiles) {
+                showValidationWarning("В архиве обнаружены посторонние файлы. Допускаются только .csv или .txt файлы, содержащие 'stat' или 'lock' в названии.");
+                return false;
+            }
+
+            if (hasCsv && hasTxt) {
+                showValidationWarning("В архиве смешаны форматы .csv и .txt. Используйте только один из форматов за раз.");
+                return false;
+            }
+
+            if (hasCsv && (!hasStatCsv || !hasLocksCsv)) {
+                showValidationWarning("При использовании .csv в архиве должен быть хотя бы один файл 'stat' и хотя бы один 'lock'.");
+                return false;
+            }
+
+            return true;
+        } catch (Exception e) {
+            showValidationWarning("Ошибка чтения архива: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Показывает предупреждение о содержимом архива.
+     *
+     * @param message текст сообщения
+     */
+    private void showValidationWarning(String message) {
+        UI ui = UI.getCurrent();
+        if (ui != null) {
+            ui.access(() -> {
+                Dialog dialog = new Dialog();
+                dialog.setHeaderTitle("Ошибка валидации архива");
+
+                Icon icon = new Icon(VaadinIcon.WARNING);
+                icon.setColor("var(--lumo-error-color)");
+                icon.getStyle().set("margin-right", "10px");
+
+                Span msgSpan = new Span(message);
+                HorizontalLayout hl = new HorizontalLayout(icon, msgSpan);
+                hl.setAlignItems(Alignment.CENTER);
+
+                dialog.add(hl);
+
+                Button okBtn = new Button("ОК", e -> dialog.close());
+                okBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
+                dialog.getFooter().add(okBtn);
+
+                dialog.open();
+            });
+        }
     }
 
     public void shutdown() {
