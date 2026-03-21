@@ -22,6 +22,7 @@ import com.vaadin.flow.dom.ThemeList;
 import com.vaadin.flow.router.Route;
 import com.vaadin.flow.theme.lumo.Lumo;
 import jakarta.annotation.PreDestroy;
+import org.jspecify.annotations.NonNull;
 import org.zazergel.statanalyzer.service.IngestService;
 import org.zazergel.statanalyzer.service.StatisticsService;
 import org.zazergel.statanalyzer.service.TooltipService;
@@ -34,10 +35,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -63,6 +61,8 @@ public class MainView extends VerticalLayout {
     private final Tabs tabs = new Tabs(tabActivity, tabLocks, tabAnalysis);
 
     private final HorizontalLayout statsPanel = new HorizontalLayout();
+    private final Button columnSettingsBtn = new Button("Настроить вид",
+            new Icon(com.vaadin.flow.component.icon.VaadinIcon.COG));
     private Integer currentSnapshotId = null;
     private Map<String, Object> lastLoadedSnapshot = null;
     private String currentSearchFilter = "";
@@ -185,7 +185,14 @@ public class MainView extends VerticalLayout {
         statsPanel.setSpacing(true);
         statsPanel.setAlignItems(Alignment.CENTER);
 
-        HorizontalLayout header = new HorizontalLayout(tabs, statsPanel);
+        columnSettingsBtn.addThemeVariants(com.vaadin.flow.component.button.ButtonVariant.LUMO_TERTIARY, com.vaadin.flow.component.button.ButtonVariant.LUMO_SMALL);
+        columnSettingsBtn.addClickListener(e -> openColumnSettingsDialog());
+
+        HorizontalLayout rightControls = new HorizontalLayout(columnSettingsBtn, statsPanel);
+        rightControls.setAlignItems(Alignment.CENTER);
+        rightControls.setSpacing(true);
+
+        HorizontalLayout header = new HorizontalLayout(tabs, rightControls);
         header.setWidthFull();
         header.setJustifyContentMode(JustifyContentMode.BETWEEN);
         header.getStyle().set("border-bottom", "1px solid var(--lumo-contrast-10pct)");
@@ -210,9 +217,11 @@ public class MainView extends VerticalLayout {
     }
 
     private void updateGridVisibility() {
-        activityGrid.setVisible(tabs.getSelectedTab().equals(tabActivity));
+        boolean isActivity = tabs.getSelectedTab().equals(tabActivity);
+        activityGrid.setVisible(isActivity);
         locksGrid.setVisible(tabs.getSelectedTab().equals(tabLocks));
         rootCauseGrid.setVisible(tabs.getSelectedTab().equals(tabAnalysis));
+        columnSettingsBtn.setVisible(isActivity);
     }
 
     private void loadSnapshotDetails(Map<String, Object> snapshot) {
@@ -420,7 +429,8 @@ public class MainView extends VerticalLayout {
         activityGrid.setSizeFull();
         activityGrid.addThemeVariants(GridVariant.LUMO_COMPACT, GridVariant.LUMO_ROW_STRIPES);
 
-        activityGrid.addColumn(createSimpleHighlightRenderer("pid")).setHeader("PID")
+        activityGrid.addColumn(createSimpleHighlightRenderer("pid"))
+                .setHeader("PID").setKey("PID")
                 .setAutoWidth(true).setFlexGrow(0).setResizable(true);
 
         activityGrid.addColumn(new ComponentRenderer<>(row -> {
@@ -430,28 +440,67 @@ public class MainView extends VerticalLayout {
                     applyBadgeStyle(badge, getThemeForState(state));
                     badge.getElement().setAttribute("title", tooltipService.getStateTooltip(state));
                     return badge;
-                })).setHeader("State")
+                })).setHeader("State").setKey("State")
                 .setAutoWidth(true).setFlexGrow(0).setResizable(true);
 
-        activityGrid.addColumn(r -> formatTime(r.get("xact_start"))).setHeader("Tx Start")
+        activityGrid.addColumn(r -> formatTime(r.get("xact_start")))
+                .setHeader("Tx Start").setKey("Tx Start")
                 .setAutoWidth(true).setFlexGrow(0).setResizable(true);
-        activityGrid.addColumn(r -> extractAppParam((String) r.get("application_name"), "Time")).setHeader("Java Start")
-                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
-        activityGrid.addColumn(r -> extractAppParam((String) r.get("application_name"), "ID")).setHeader("Thread ID")
+
+        activityGrid.addColumn(r -> extractAppParam((String) r.get("application_name"), "Time"))
+                .setHeader("Java Start").setKey("Java Start")
                 .setAutoWidth(true).setFlexGrow(0).setResizable(true);
 
         activityGrid.addColumn(new ComponentRenderer<>(row -> {
-                    String evt = (String) row.get("wait_event");
-                    if (evt == null || evt.isBlank()) return new Span();
-                    Span badge = new Span(evt);
-                    applyBadgeStyle(badge, "contrast");
-                    badge.getElement().setAttribute("title", tooltipService.getWaitEventTooltip(evt));
-                    return badge;
-                })).setHeader("Wait Event")
+                    String val = extractAppParam((String) row.get("application_name"), "ID");
+                    Span span = new Span();
+                    if (val == null || val.isBlank()) return span;
+
+                    if (currentSearchFilter != null && !currentSearchFilter.isBlank() && val.toLowerCase().contains(currentSearchFilter.toLowerCase())) {
+                        String safeVal = val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                        String safeFilter = currentSearchFilter.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                        String regex = "(?i)(" + java.util.regex.Pattern.quote(safeFilter) + ")";
+                        String highlighted = safeVal.replaceAll(regex, "<mark>$1</mark>");
+                        span.getElement().setProperty("innerHTML", highlighted);
+                    } else {
+                        span.setText(val);
+                    }
+                    return span;
+                })).setHeader("Thread ID").setKey("Thread ID")
                 .setAutoWidth(true).setFlexGrow(0).setResizable(true);
 
-        activityGrid.addColumn(createHighlightRenderer("query")).setHeader("Query")
-                .setFlexGrow(1).setResizable(true);
+        activityGrid.addColumn(createSimpleHighlightRenderer("usename"))
+                .setHeader("User").setKey("User")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(createSimpleHighlightRenderer("application_name"))
+                .setHeader("App").setKey("App")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(new ComponentRenderer<>(row -> {
+                    String waitEvent = (String) row.get("wait_event");
+                    Span badge = new Span();
+                    if (waitEvent == null || waitEvent.isBlank()) return badge;
+
+                    applyBadgeStyle(badge, "contrast");
+                    badge.getElement().setAttribute("title", tooltipService.getWaitEventTooltip(waitEvent));
+
+                    if (currentSearchFilter != null && !currentSearchFilter.isBlank() && waitEvent.toLowerCase().contains(currentSearchFilter.toLowerCase())) {
+                        String safeVal = waitEvent.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                        String safeFilter = currentSearchFilter.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+                        String regex = "(?i)(" + java.util.regex.Pattern.quote(safeFilter) + ")";
+                        String highlighted = safeVal.replaceAll(regex, "<mark>$1</mark>");
+                        badge.getElement().setProperty("innerHTML", highlighted);
+                    } else {
+                        badge.setText(waitEvent);
+                    }
+                    return badge;
+                })).setHeader("Wait Event").setKey("Wait Event")
+                .setAutoWidth(true).setFlexGrow(0).setResizable(true);
+
+        activityGrid.addColumn(createHighlightRenderer("query"))
+                .setHeader("Query").setKey("Query")
+                .setAutoWidth(true).setFlexGrow(1).setResizable(true);
 
         activityGrid.addItemDoubleClickListener(e -> showQueryDialog((String) e.getItem().get("query"), null));
     }
@@ -558,7 +607,6 @@ public class MainView extends VerticalLayout {
                 });
     }
 
-
     private Renderer<Map<String, Object>> createHighlightRenderer(String key) {
         return LitRenderer.<Map<String, Object>>of(
                 "<span style='font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; font-size: 12px;' .innerHTML='${item.htmlContent}'></span>"
@@ -568,7 +616,7 @@ public class MainView extends VerticalLayout {
         });
     }
 
-    private String formatTime(Object tsObj) {
+    private @NonNull String formatTime(Object tsObj) {
         if (tsObj == null) return "";
         try {
             long millis = ((Timestamp) tsObj).getTime();
@@ -635,6 +683,59 @@ public class MainView extends VerticalLayout {
         s.getStyle().set("overflow", "auto");
         return s;
     }
+
+    /**
+     * Открывает диалог настройки отображаемых столбцов
+     */
+    private void openColumnSettingsDialog() {
+        Dialog dialog = new Dialog();
+        dialog.setHeaderTitle("Отображаемые столбцы");
+        dialog.setWidth("350px");
+
+        VerticalLayout layout = new VerticalLayout();
+        layout.setPadding(false);
+
+        List<Grid.Column<Map<String, Object>>> cols = activityGrid.getColumns();
+        List<com.vaadin.flow.component.checkbox.Checkbox> checkBoxes = new ArrayList<>();
+
+        com.vaadin.flow.component.checkbox.Checkbox pidCheck = new com.vaadin.flow.component.checkbox.Checkbox("PID", true);
+        pidCheck.setEnabled(false);
+        layout.add(pidCheck);
+
+        for (Grid.Column<Map<String, Object>> col : cols) {
+            String key = col.getKey();
+            if (key == null || key.equals("PID")) continue;
+
+            com.vaadin.flow.component.checkbox.Checkbox cb = new com.vaadin.flow.component.checkbox.Checkbox(key, col.isVisible());
+            checkBoxes.add(cb);
+            layout.add(cb);
+
+            cb.addValueChangeListener(e -> {
+                if (!e.getValue()) {
+                    long visibleCount = checkBoxes.stream().filter(com.vaadin.flow.component.checkbox.Checkbox::getValue).count();
+                    if (visibleCount < 2) {
+                        cb.setValue(true);
+                        com.vaadin.flow.component.notification.Notification.show(
+                                "Должно быть выбрано минимум 3 столбца (включая PID)",
+                                3000, com.vaadin.flow.component.notification.Notification.Position.MIDDLE);
+                    } else {
+                        col.setVisible(false);
+                    }
+                } else {
+                    col.setVisible(true);
+                }
+            });
+        }
+
+        dialog.add(layout);
+
+        Button closeBtn = new Button("Закрыть", e -> dialog.close());
+        closeBtn.addThemeVariants(com.vaadin.flow.component.button.ButtonVariant.LUMO_PRIMARY);
+        dialog.getFooter().add(closeBtn);
+
+        dialog.open();
+    }
+
 
     @Override
     protected void onAttach(AttachEvent attachEvent) {

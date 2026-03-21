@@ -43,35 +43,35 @@ public class StatisticsService {
         log.debug("Fetching snapshots from DB with filter: {}", searchFilter);
 
         String coreSql = """
-                    SELECT s.id, s.snapshot_timestamp,
-                    (SELECT count(*) FROM stat_activity a WHERE a.snapshot_id = s.id) as act_cnt,
-                    (SELECT count(*) FROM locks_data l WHERE l.snapshot_id = s.id) as lock_cnt
-                """;
+            SELECT s.id, s.snapshot_timestamp,
+                   (SELECT count(*) FROM stat_activity a WHERE a.snapshot_id = s.id) as act_cnt,
+                   (SELECT count(*) FROM locks_data l WHERE l.snapshot_id = s.id) as lock_cnt
+            """;
 
         String orderSql = " ORDER BY s.snapshot_timestamp ASC";
 
         if (searchFilter != null && !searchFilter.isBlank()) {
             String p = "%" + searchFilter.trim() + "%";
             String sql = coreSql + """
-                        , (
-                            (SELECT count(*) FROM stat_activity a WHERE a.snapshot_id = s.id
-                             AND (a.query ILIKE ? OR a.usename ILIKE ? OR a.wait_event ILIKE ? OR CAST(a.pid AS TEXT) ILIKE ?))
-                            +
-                            (SELECT count(*) FROM locks_data l WHERE l.snapshot_id = s.id
-                             AND (l.waiting_query ILIKE ? OR l.locking_query ILIKE ? OR CAST(l.waiting_pid AS TEXT) ILIKE ? OR CAST(l.locking_pid AS TEXT) ILIKE ?))
-                        ) as search_matches
-                        FROM snapshots s
-                        WHERE (
-                            EXISTS (
-                                SELECT 1 FROM stat_activity a WHERE a.snapshot_id = s.id
-                                AND (a.query ILIKE ? OR a.usename ILIKE ? OR a.wait_event ILIKE ? OR CAST(a.pid AS TEXT) ILIKE ?)
-                            ) OR EXISTS (
-                                SELECT 1 FROM locks_data l WHERE l.snapshot_id = s.id
-                                AND (l.waiting_query ILIKE ? OR l.locking_query ILIKE ? OR CAST(l.waiting_pid AS TEXT) ILIKE ? OR CAST(l.locking_pid AS TEXT) ILIKE ?)
-                            )
-                        )
-                    """ + orderSql;
-            return jdbcTemplate.queryForList(sql, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p);
+                , (
+                    (SELECT count(*) FROM stat_activity a WHERE a.snapshot_id = s.id
+                     AND (a.query ILIKE ? OR a.usename ILIKE ? OR a.wait_event ILIKE ? OR a.application_name ILIKE ? OR CAST(a.pid AS TEXT) ILIKE ?))
+                    +
+                    (SELECT count(*) FROM locks_data l WHERE l.snapshot_id = s.id
+                     AND (l.waiting_query ILIKE ? OR l.locking_query ILIKE ? OR CAST(l.waiting_pid AS TEXT) ILIKE ? OR CAST(l.locking_pid AS TEXT) ILIKE ?))
+                  ) as search_matches
+                FROM snapshots s
+                WHERE (
+                    EXISTS (
+                        SELECT 1 FROM stat_activity a WHERE a.snapshot_id = s.id
+                        AND (a.query ILIKE ? OR a.usename ILIKE ? OR a.wait_event ILIKE ? OR a.application_name ILIKE ? OR CAST(a.pid AS TEXT) ILIKE ?)
+                    ) OR EXISTS (
+                        SELECT 1 FROM locks_data l WHERE l.snapshot_id = s.id
+                        AND (l.waiting_query ILIKE ? OR l.locking_query ILIKE ? OR CAST(l.waiting_pid AS TEXT) ILIKE ? OR CAST(l.locking_pid AS TEXT) ILIKE ?)
+                    )
+                )
+                """ + orderSql;
+            return jdbcTemplate.queryForList(sql, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p, p);
         } else {
             return jdbcTemplate.queryForList(coreSql + " FROM snapshots s" + orderSql);
         }
