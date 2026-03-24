@@ -1,7 +1,6 @@
 package org.zazergel.statanalyzer.parser;
 
 import lombok.extern.slf4j.Slf4j;
-import org.jspecify.annotations.NonNull;
 import org.springframework.stereotype.Component;
 
 import java.io.BufferedReader;

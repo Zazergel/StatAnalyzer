@@ -48,3 +48,4 @@ CREATE INDEX idx_stat_snapshot ON stat_activity(snapshot_id);
 CREATE INDEX idx_locks_snapshot ON locks_data(snapshot_id);
 CREATE INDEX idx_snapshots_time ON snapshots(snapshot_timestamp);
 CREATE UNIQUE INDEX idx_unique_snapshot_time ON snapshots(snapshot_timestamp);
+CREATE UNIQUE INDEX idx_unique_stat_snapshot_pid ON stat_activity(snapshot_id, pid);

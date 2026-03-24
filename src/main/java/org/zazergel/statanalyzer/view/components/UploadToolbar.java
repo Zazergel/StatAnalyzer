@@ -84,7 +84,6 @@ public class UploadToolbar extends FlexLayout {
             this.currentTimezoneOffset = e.getValue();
             onTimezoneChange.accept(e.getValue());
         });
-
         loadBtn = new Button("Загрузить", new Icon(VaadinIcon.PLAY));
         loadBtn.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
         preventShrink(loadBtn);
@@ -129,6 +128,7 @@ public class UploadToolbar extends FlexLayout {
             searchField.clear();
             onClear.run();
             ingestService.clearCache();
+            System.gc();
         });
         clearBtn.addThemeVariants(ButtonVariant.LUMO_ERROR, ButtonVariant.LUMO_SMALL);
         preventShrink(clearBtn);
@@ -146,7 +146,9 @@ public class UploadToolbar extends FlexLayout {
                 .set("color", "var(--lumo-secondary-text-color)");
         preventShrink(statusLabel);
 
-        add(timezoneSelect, pathField, browseBtn, loadBtn, progressBar, statusLabel, searchField, chartBtn, themeBtn, clearBtn);
+        MemoryMonitor memoryMonitor = new MemoryMonitor(chartBtn);
+
+        add(timezoneSelect, pathField, browseBtn, loadBtn, progressBar, statusLabel, searchField, chartBtn, memoryMonitor, themeBtn, clearBtn);
         setDataLoadedState(false);
     }
 
