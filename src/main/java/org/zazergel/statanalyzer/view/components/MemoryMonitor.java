@@ -1,6 +1,5 @@
 package org.zazergel.statanalyzer.view.components;
 
-
 import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.DetachEvent;
 import com.vaadin.flow.component.UI;
@@ -9,7 +8,6 @@ import com.vaadin.flow.component.html.Span;
 import com.vaadin.flow.component.notification.Notification;
 import com.vaadin.flow.component.notification.NotificationVariant;
 
-import java.util.Arrays;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,8 +25,17 @@ public class MemoryMonitor extends Span {
     public MemoryMonitor(Button chartBtn) {
         this.chartBtn = chartBtn;
 
-        getElement().getThemeList().add("badge");
-        getElement().getStyle().set("flex-shrink", "0");
+        getStyle()
+                .set("display", "inline-flex")
+                .set("align-items", "center")
+                .set("box-sizing", "border-box")
+                .set("padding", "0.25em 0.5em")
+                .set("border-radius", "var(--lumo-border-radius-m)")
+                .set("font-size", "var(--lumo-font-size-s)")
+                .set("line-height", "1")
+                .set("font-weight", "500")
+                .set("flex-shrink", "0");
+
         setText("RAM: --%");
     }
 
@@ -36,7 +43,6 @@ public class MemoryMonitor extends Span {
     protected void onAttach(AttachEvent attachEvent) {
         super.onAttach(attachEvent);
         UI ui = attachEvent.getUI();
-
         scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> performMemoryCheck(ui), 2, 5, TimeUnit.SECONDS);
     }
@@ -76,14 +82,19 @@ public class MemoryMonitor extends Span {
 
     private void updateBadgeVisuals(long usedMb, long maxMb, double usedPercentage) {
         setText(String.format("RAM: %d / %d MB (%.0f%%)", usedMb, maxMb, usedPercentage));
-        Arrays.asList("success", "error", "contrast").forEach(getElement().getThemeList()::remove);
 
         if (usedPercentage < 70) {
-            getElement().getThemeList().add("success");
+            getStyle()
+                    .set("background-color", "var(--lumo-success-color-10pct)")
+                    .set("color", "var(--lumo-success-text-color)");
         } else if (usedPercentage >= 70 && usedPercentage < 85) {
-            getElement().getThemeList().add("contrast");
+            getStyle()
+                    .set("background-color", "var(--lumo-contrast-20pct)")
+                    .set("color", "var(--lumo-body-text-color)");
         } else {
-            getElement().getThemeList().add("error");
+            getStyle()
+                    .set("background-color", "var(--lumo-error-color-10pct)")
+                    .set("color", "var(--lumo-error-text-color)");
         }
     }
 
