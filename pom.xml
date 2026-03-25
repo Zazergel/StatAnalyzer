@@ -13,7 +13,7 @@
 
     <groupId>org.zazergel</groupId>
     <artifactId>StatAnalyzer</artifactId>
-    <version>3.4.4</version>
+    <version>3.6.1</version>
     <name>StatAnalyzer</name>
 
     <properties>

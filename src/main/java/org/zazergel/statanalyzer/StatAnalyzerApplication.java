@@ -2,6 +2,7 @@ package org.zazergel.statanalyzer;
 
 import com.vaadin.flow.component.page.AppShellConfigurator;
 import com.vaadin.flow.component.page.Push;
+import com.vaadin.flow.router.PageTitle;
 import org.jspecify.annotations.NonNull;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -11,7 +12,9 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 
 @Push
+@PageTitle("StatAnalyzer")
 @SpringBootApplication
+
 public class StatAnalyzerApplication implements AppShellConfigurator {
 
     public static void main(String[] args) {

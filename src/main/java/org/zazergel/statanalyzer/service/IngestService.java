@@ -65,43 +65,39 @@ public class IngestService {
     /**
      * Обрабатывает ZIP-архив с файлами данных.
      *
-     * @param zipStream       поток ZIP-архива
-     * @param offsetHours     смещение часового пояса
+     * @param zipStream   поток ZIP-архива
+     * @param offsetHours смещение часового пояса
      * @param onFileProcessed callback после обработки каждого файла
      */
     @CacheEvict(value = {"snapshots", "snapshotData", "victims"}, allEntries = true)
     public void ingestZip(InputStream zipStream, int offsetHours, Consumer<Integer> onFileProcessed) {
         try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(zipStream)) {
             java.util.zip.ZipEntry entry;
-            log.info("Parsing ZIP data...");
+            log.info("Начат парсинг ZIP-архива...");
+            int fileCount = 0;
+
             while ((entry = zis.getNextEntry()) != null) {
                 if (entry.isDirectory() || entry.getName().startsWith("__MACOSX") || entry.getName().startsWith(".")) {
                     continue;
                 }
 
                 String filename = entry.getName();
+                log.debug("Извлечение файла из архива: {}", filename);
+
                 ShieldedInputStream shieldedStream = new ShieldedInputStream(zis);
                 processSingleFile(filename, shieldedStream, offsetHours);
                 onFileProcessed.accept(1);
                 zis.closeEntry();
+                fileCount++;
             }
+            log.info("ZIP-архив успешно разобран. Всего обработано файлов: {}", fileCount);
+
         } catch (java.io.IOException e) {
-            log.error("Error reading ZIP stream", e);
+            log.error("Ошибка при чтении потока ZIP-архива", e);
             throw new RuntimeException(e);
         }
     }
 
-    /**
-     * Загружает один файл (вызывается при загрузке не-ZIP файла).
-     *
-     * @param filename    имя файла
-     * @param fileContent содержимое файла
-     * @param offsetHours смещение часового пояса
-     */
-    @CacheEvict(value = {"snapshots", "snapshotData", "victims"}, allEntries = true)
-    public void ingest(String filename, InputStream fileContent, int offsetHours) {
-        processSingleFile(filename, fileContent, offsetHours);
-    }
 
     /**
      * Читает данные напрямую с локального диска сервера. Поддерживает как конкретные файлы (включая ZIP),
@@ -156,36 +152,43 @@ public class IngestService {
         }
     }
 
-
-
     /**
      * Определяет формат файла (CSV или TXT) и вызывает соответствующий метод загрузки.
      */
     private void processSingleFile(String filename, InputStream fileContent, int offsetHours) {
         try {
+            log.info("Начало обработки файла: {}", filename);
+            long startTime = System.currentTimeMillis();
+
             BufferedInputStream buffered = new BufferedInputStream(fileContent, 65536);
             String lowerFilename = filename.toLowerCase();
             boolean csv = looksLikeCsv(filename, buffered);
 
             if (lowerFilename.contains("stat")) {
                 if (csv) {
+                    log.debug("Файл {} определен как CSV (PgStatActivity)", filename);
                     ingestPgStatCsv(filename, buffered, offsetHours);
                 } else {
+                    log.debug("Файл {} определен как TXT (PgStatActivity)", filename);
                     Integer snapshotId = getOrCreateSnapshotId(filename, offsetHours);
                     ingestPgStat(snapshotId, buffered, offsetHours);
                 }
             } else if (lowerFilename.contains("lock")) {
                 if (csv) {
+                    log.debug("Файл {} определен как CSV (Locks)", filename);
                     ingestLocksCsv(filename, buffered, offsetHours);
                 } else {
+                    log.debug("Файл {} определен как TXT (Locks)", filename);
                     Integer snapshotId = getOrCreateSnapshotId(filename, offsetHours);
                     ingestLocks(snapshotId, buffered);
                 }
             } else {
-                log.warn("Unknown file type, skipping: {}", filename);
+                log.warn("Неизвестный тип файла, пропускаем: {}", filename);
             }
+
+            log.info("Файл {} успешно обработан за {} мс", filename, (System.currentTimeMillis() - startTime));
         } catch (Exception e) {
-            log.error("Failed to ingest file: {}", filename, e);
+            log.error("Критическая ошибка при загрузке файла: {}", filename, e);
             throw new RuntimeException(e);
         }
     }
@@ -349,6 +352,7 @@ public class IngestService {
                     snapshot_id, datid, datname, pid, usename, application_name,
                     client_addr, wait_event_type, wait_event, state, query, xact_start
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
                 """;
         List<Object[]> batch = new ArrayList<>(BATCH_SIZE);
 
@@ -385,6 +389,7 @@ public class IngestService {
                     snapshot_id, datid, datname, pid, usename, application_name,
                     client_addr, wait_event_type, wait_event, state, query, xact_start
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
                 """;
 
         List<Object[]> batch = new ArrayList<>(BATCH_SIZE);
@@ -582,6 +587,8 @@ public class IngestService {
      * Вычисляет пары waiter/blocker из сырых lock-строк и вставляет в БД.
      */
     private void insertComputedLocks(Integer snapshotId, List<RawLockRow> rows) {
+        log.debug("Начало вычисления пар блокировок для snapshotId={}. Получено {} сырых строк (RawLocks)", snapshotId, rows.size());
+
         String sql = """
                 INSERT INTO locks_data (
                     snapshot_id, waiting_pid, waiting_mode, waiting_query,
@@ -589,23 +596,27 @@ public class IngestService {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """;
 
+        long loadStart = System.currentTimeMillis();
         Map<Integer, ActivityInfo> activityByPid = loadActivityInfo(snapshotId);
+        log.debug("Загружено {} активных сессий в память для snapshotId={} за {} мс", activityByPid.size(), snapshotId, (System.currentTimeMillis() - loadStart));
+
         Map<LockKey, List<RawLockRow>> byKey = new HashMap<>();
 
         for (RawLockRow r : rows) {
-            if (r.lockKey != null && r.pid != null && r.granted != null) {
-                byKey.computeIfAbsent(r.lockKey, k -> new ArrayList<>()).add(r);
+            if (r.lockKey() != null && r.pid() != null && r.granted() != null) {
+                byKey.computeIfAbsent(r.lockKey(), k -> new ArrayList<>()).add(r);
             }
         }
 
         List<Object[]> batch = new ArrayList<>(BATCH_SIZE);
+        int insertedPairs = 0;
 
         for (List<RawLockRow> group : byKey.values()) {
             List<RawLockRow> waiters = new ArrayList<>();
             List<RawLockRow> holders = new ArrayList<>();
 
             for (RawLockRow r : group) {
-                if (Boolean.TRUE.equals(r.granted)) {
+                if (Boolean.TRUE.equals(r.granted())) {
                     holders.add(r);
                 } else {
                     waiters.add(r);
@@ -615,18 +626,19 @@ public class IngestService {
             if (!waiters.isEmpty() && !holders.isEmpty()) {
                 for (RawLockRow w : waiters) {
                     for (RawLockRow h : holders) {
-                        if (w.pid.equals(h.pid)) continue;
+                        if (w.pid().equals(h.pid())) continue;
 
-                        ActivityInfo wAct = activityByPid.get(w.pid);
-                        ActivityInfo hAct = activityByPid.get(h.pid);
+                        ActivityInfo wAct = activityByPid.get(w.pid());
+                        ActivityInfo hAct = activityByPid.get(h.pid());
 
                         batch.add(new Object[]{
                                 snapshotId,
-                                w.pid, w.mode, wAct != null ? wAct.query : null,
-                                h.pid, h.mode, hAct != null ? hAct.query : null,
-                                wAct != null ? wAct.waitEventType : null,
-                                wAct != null ? wAct.waitEvent : null
+                                w.pid(), w.mode(), wAct != null ? wAct.query() : null,
+                                h.pid(), h.mode(), hAct != null ? hAct.query() : null,
+                                wAct != null ? wAct.waitEventType() : null,
+                                wAct != null ? wAct.waitEvent() : null
                         });
+                        insertedPairs++;
 
                         if (batch.size() >= BATCH_SIZE) {
                             jdbcTemplate.batchUpdate(sql, batch);
@@ -640,6 +652,10 @@ public class IngestService {
         if (!batch.isEmpty()) {
             jdbcTemplate.batchUpdate(sql, batch);
         }
+
+        log.debug("Вычисление завершено. Сгенерировано и вставлено {} пар блокировок для snapshotId={}", insertedPairs, snapshotId);
+        activityByPid.clear();
+        byKey.clear();
     }
 
     /**
@@ -666,7 +682,7 @@ public class IngestService {
 
     /**
      * Парсит timestamp из CSV (snap_ts).
-     * НЕ ОКРУГЛЯЕТ — берет точное значение из CSV.
+     * Берет точное значение из CSV.
      */
     private LocalDateTime parseSnapshotTimestamp(String s, int offsetHours) {
         if (s == null || s.isBlank()) return null;
