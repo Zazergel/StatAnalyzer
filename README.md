@@ -19,12 +19,6 @@
 
 Веб приложение для анализа файлов, содержащих статистику запросов и блокировок для баз данных PostgreSQL (pgstat и locks).
 
-<img width="1900" height="900" alt="image" src="https://github.com/user-attachments/assets/f1d8f884-a25d-43c0-8bca-5db3e000f816" />
-
-<img width="1900" height="900" alt="image" src="https://github.com/user-attachments/assets/507b4bec-7c2a-4929-a005-f0f72a520dae" />
-
-
-
 ## Возможности
 
 - Импорт данных напрямую с диска: через указания пути к директории или к zip архиву;
@@ -56,3 +50,9 @@
 ```bash
 java -Xms256m -Xmx4g -XX:+UseStringDeduplication -jar StatAnalyzer-X.X.X.jar
 ```
+
+## Документация
+
+[Documentation](https://github.com/Zazergel/StatAnalyzer/blob/main/Documentation.md)
+
+
