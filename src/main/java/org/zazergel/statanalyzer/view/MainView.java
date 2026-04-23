@@ -15,6 +15,7 @@ import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.component.tabs.Tab;
 import com.vaadin.flow.component.tabs.Tabs;
 import com.vaadin.flow.component.tabs.TabsVariant;
+import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.data.renderer.ComponentRenderer;
 import com.vaadin.flow.data.renderer.LitRenderer;
 import com.vaadin.flow.data.renderer.Renderer;
@@ -31,11 +32,14 @@ import org.zazergel.statanalyzer.view.components.ChartDialog;
 import org.zazergel.statanalyzer.view.components.TimelineComponent;
 import org.zazergel.statanalyzer.view.components.UploadToolbar;
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.TimeZone;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -61,7 +65,7 @@ public class MainView extends VerticalLayout {
     private final Tabs tabs = new Tabs(tabActivity, tabLocks, tabAnalysis);
 
     private final HorizontalLayout statsPanel = new HorizontalLayout();
-    private final Button columnSettingsBtn = new Button("Настроить вид",
+    private final Button columnSettingsBtn = new Button("Настройки",
             new Icon(com.vaadin.flow.component.icon.VaadinIcon.COG));
     private Integer currentSnapshotId = null;
     private Map<String, Object> lastLoadedSnapshot = null;
@@ -72,6 +76,8 @@ public class MainView extends VerticalLayout {
 
     private String activeStateFilter = null;
     private String activeLockFilter = null;
+
+    private int highlightThresholdMillis = 60000;
 
     public MainView(IngestService ingestService,
                     StatisticsService statisticsService,
@@ -127,7 +133,7 @@ public class MainView extends VerticalLayout {
 
     private void onTimezoneChanged(Integer offset) {
         if (activityGrid.isVisible()) {
-            activityGrid.getDataProvider().refreshAll();
+            updateActivityGridItems();
         }
         if (rootCauseGrid.isVisible()) {
             rootCauseGrid.getDataProvider().refreshAll();
@@ -372,14 +378,17 @@ public class MainView extends VerticalLayout {
     private void updateActivityGridItems() {
         if (currentActivityData == null) return;
 
+        List<Map<String, Object>> itemsToSet;
         if (activeStateFilter == null) {
-            activityGrid.setItems(currentActivityData);
+            // Create a new list to force grid re-render
+            itemsToSet = new ArrayList<>(currentActivityData);
         } else {
-            List<Map<String, Object>> filtered = currentActivityData.stream()
+            itemsToSet = currentActivityData.stream()
                     .filter(row -> activeStateFilter.equals(row.get("state")))
-                    .toList();
-            activityGrid.setItems(filtered);
+                    .collect(Collectors.toList());
         }
+        activityGrid.setItems(itemsToSet);
+        applyHighlightStyles();
     }
 
     private void updateLocksGridItems() {
@@ -690,7 +699,7 @@ public class MainView extends VerticalLayout {
     private void openColumnSettingsDialog() {
         Dialog dialog = new Dialog();
         dialog.setHeaderTitle("Отображаемые столбцы");
-        dialog.setWidth("350px");
+        dialog.setWidth("400px");
 
         VerticalLayout layout = new VerticalLayout();
         layout.setPadding(false);
@@ -727,6 +736,61 @@ public class MainView extends VerticalLayout {
             });
         }
 
+        Div separator = new Div();
+        separator.getStyle().set("border-top", "1px solid var(--lumo-contrast-10pct)");
+        separator.getStyle().set("margin", "var(--lumo-space-m) 0");
+        layout.add(separator);
+
+        Span thresholdLabel = new Span("Порог подсветки (TX Start vs Timeline):");
+        thresholdLabel.getStyle().set("font-weight", "bold");
+        layout.add(thresholdLabel);
+
+        HorizontalLayout thresholdLayout = new HorizontalLayout();
+        thresholdLayout.setSpacing(true);
+        thresholdLayout.setAlignItems(Alignment.CENTER);
+
+        IntegerField hoursField = new IntegerField("Часы");
+        hoursField.setWidth("80px");
+        hoursField.setMin(0);
+        hoursField.setValue(highlightThresholdMillis / 3600000);
+
+        IntegerField minutesField = new IntegerField("Минуты");
+        minutesField.setWidth("80px");
+        minutesField.setMin(0);
+        minutesField.setMax(59);
+        minutesField.setValue((highlightThresholdMillis % 3600000) / 60000);
+
+        IntegerField secondsField = new IntegerField("Секунды");
+        secondsField.setWidth("80px");
+        secondsField.setMin(0);
+        secondsField.setMax(59);
+        secondsField.setValue((highlightThresholdMillis % 60000) / 1000);
+
+        IntegerField millisField = new IntegerField("Миллисекунды");
+        millisField.setWidth("80px");
+        millisField.setMin(0);
+        millisField.setMax(999);
+        millisField.setValue(highlightThresholdMillis % 1000);
+
+        thresholdLayout.add(hoursField, minutesField, secondsField, millisField);
+        layout.add(thresholdLayout);
+
+        Button applyBtn = new Button("Применить порог", e -> {
+            int hours = hoursField.getValue() != null ? hoursField.getValue() : 0;
+            int minutes = minutesField.getValue() != null ? minutesField.getValue() : 0;
+            int seconds = secondsField.getValue() != null ? secondsField.getValue() : 0;
+            int millis = millisField.getValue() != null ? millisField.getValue() : 0;
+
+            highlightThresholdMillis = hours * 3600000 + minutes * 60000 + seconds * 1000 + millis;
+            updateActivityGridItems();
+
+            com.vaadin.flow.component.notification.Notification.show(
+                    "Порог подсветки: " + formatThreshold(highlightThresholdMillis),
+                    2000, com.vaadin.flow.component.notification.Notification.Position.BOTTOM_CENTER);
+        });
+        applyBtn.addThemeVariants(com.vaadin.flow.component.button.ButtonVariant.LUMO_TERTIARY);
+        layout.add(applyBtn);
+
         dialog.add(layout);
 
         Button closeBtn = new Button("Закрыть", e -> dialog.close());
@@ -736,11 +800,271 @@ public class MainView extends VerticalLayout {
         dialog.open();
     }
 
+    private String formatThreshold(long millis) {
+        long h = millis / 3600000;
+        long m = (millis % 3600000) / 60000;
+        long s = (millis % 60000) / 1000;
+        long ms = millis % 1000;
+        return String.format("%dч %dм %dс %dмс", h, m, s, ms);
+    }
+
+    // ========================================================================
+    // Row highlighting — timestamp helpers and inline-style application
+    // ========================================================================
+
+    /**
+     * Converts various timestamp representations to epoch millis.
+     * Supports: java.sql.Timestamp, java.time.LocalDateTime, java.time.LocalTime,
+     * Long, Number, and ISO-formatted String.
+     * Returns -1 if conversion fails.
+     */
+    private long toMillis(Object obj) {
+        switch (obj) {
+            case null -> {
+                return -1;
+            }
+            case Timestamp ts -> {
+                return ts.getTime();
+            }
+            case java.time.LocalDateTime ldt -> {
+                return Timestamp.valueOf(ldt).getTime();
+            }
+            case java.time.LocalTime lt -> {
+                // No date context — use epoch day 0
+                return Timestamp.valueOf(
+                        java.time.LocalDate.ofEpochDay(0).atTime(lt)).getTime();
+                // No date context — use epoch day 0
+            }
+            case Number n -> {
+                return n.longValue();
+            }
+            case String s -> {
+                try {
+                    return Long.parseLong(s.trim());
+                } catch (NumberFormatException e) {
+                    // try ISO format
+                    try {
+                        return Timestamp.valueOf(s.trim()).getTime();
+                    } catch (IllegalArgumentException ignored) {
+                    }
+                }
+            }
+            default -> {
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Extracts the time-of-day portion (milliseconds since midnight UTC)
+     * from an epoch millis value. Used for comparing displayed times
+     * independently of date components.
+     */
+    private long getTimeOfDayMillis(long epochMillis) {
+        return (epochMillis % 86400000L + 86400000L) % 86400000L;
+    }
+
+    /**
+     * Resolves the snapshot timestamp from lastLoadedSnapshot.
+     * Tries multiple possible keys: snapshot_timestamp, snap_ts, timestamp, ts.
+     * Returns -1 if none found.
+     */
+    private long resolveSnapshotMillis() {
+        if (lastLoadedSnapshot == null) return -1;
+        for (String key : new String[]{"snapshot_timestamp", "snap_ts", "timestamp", "ts"}) {
+            Object val = lastLoadedSnapshot.get(key);
+            if (val != null) {
+                long ms = toMillis(val);
+                if (ms >= 0) return ms;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Applies row highlight styles based on TX Start vs snapshot timestamp.
+     * Computes the set of highlighted PIDs server-side, passes them to JS,
+     * then JS reads each row's PID from the first cell's slotted content
+     * and applies inline styles accordingly.
+     */
+    private void applyHighlightStyles() {
+        if (lastLoadedSnapshot == null || currentActivityData == null) return;
+
+        long snapshotTimeMillis = resolveSnapshotMillis();
+        if (snapshotTimeMillis < 0) return;
+
+        int offset = toolbar.getTimezoneOffset() != null ? toolbar.getTimezoneOffset() : 0;
+
+        // Compute set of PIDs that should be highlighted
+        java.util.Set<Integer> highlightPids = new java.util.HashSet<>();
+        int diagCount = 0;
+        for (Map<String, Object> row : currentActivityData) {
+            try {
+                Object txStartObj = row.get("xact_start");
+                if (txStartObj == null) continue;
+                long txStartMillis = toMillis(txStartObj);
+                if (txStartMillis < 0) continue;
+                long adjustedTxStart = txStartMillis + (offset * 3600000L);
+
+                // Compare DISPLAYED times only (time-of-day, no dates).
+                // The timeline displays snapshot time in the SYSTEM timezone
+                // (e.g. Europe/Moscow), while the TX START column uses the
+                // user-configurable UTC offset. We must match both to what
+                // the user actually sees on screen.
+                long txTimeOfDay = getTimeOfDayMillis(adjustedTxStart);
+                long systemOffsetMs = java.util.TimeZone.getDefault().getRawOffset();
+                long snapTimeOfDay = getTimeOfDayMillis(snapshotTimeMillis + systemOffsetMs);
+
+                long diff = snapTimeOfDay - txTimeOfDay;
+                if (diff < 0) diff += 86400000L; // midnight wrap-around
+                if (diff > 43200000L) diff = 0;  // >12h means TX is after timeline
+
+                // Diagnostic: log first 2 rows
+                if (diagCount < 2) {
+                    diagCount++;
+                    System.err.println("[HL-DIAG] row#" + diagCount
+                            + " snap_epoch=" + snapshotTimeMillis
+                            + " snap_tod=" + snapTimeOfDay
+                            + " (" + (snapTimeOfDay/3600000) + "h" + ((snapTimeOfDay%3600000)/60000) + "m)"
+                            + " tx_epoch=" + txStartMillis
+                            + " tx_tod=" + txTimeOfDay
+                            + " (" + (txTimeOfDay/3600000) + "h" + ((txTimeOfDay%3600000)/60000) + "m)"
+                            + " sys_tz_offset=" + (systemOffsetMs/3600000) + "h"
+                            + " user_offset=" + offset
+                            + " diff=" + diff + "ms"
+                            + " threshold=" + highlightThresholdMillis + "ms"
+                            + " => " + (diff > highlightThresholdMillis ? "HIGHLIGHT" : "skip")
+                            + " pid=" + row.get("pid"));
+                }
+
+                if (diff > highlightThresholdMillis) {
+                    Object pidObj = row.get("pid");
+                    if (pidObj instanceof Number) {
+                        highlightPids.add(((Number) pidObj).intValue());
+                    }
+                }
+            } catch (Exception ignored) { }
+        }
+        System.err.println("[HL-DIAG] Total highlighted PIDs: " + highlightPids.size()
+                + " of " + currentActivityData.size() + " rows (threshold="
+                + formatThreshold(highlightThresholdMillis) + ", offset=" + offset + ")");
+
+        String pidList = highlightPids.stream()
+                .map(String::valueOf)
+                .collect(java.util.stream.Collectors.joining(","));
+
+        boolean isDark = UI.getCurrent().getElement().getThemeList().contains(Lumo.DARK);
+
+        UI.getCurrent().beforeClientResponse(activityGrid, ctx -> {
+            activityGrid.getElement().executeJs("""
+                (function() {
+                    var grid = $0;
+                    var isDark = $1;
+                    var pidStr = $2;
+                    var bg = isDark ? 'rgba(255,82,82,0.18)' : 'rgba(244,67,54,0.12)';
+                    var bar = isDark ? 'inset 3px 0 0 0 rgba(255,82,82,0.55)' : 'inset 3px 0 0 0 rgba(244,67,54,0.7)';
+
+                    // Build set of highlighted PIDs
+                    var hlPids = {};
+                    if (pidStr) {
+                        pidStr.split(',').forEach(function(p) { hlPids[p.trim()] = true; });
+                    }
+                    var hlCount = Object.keys(hlPids).length;
+
+                    // Function to read PID from a <tr>'s first cell
+                    function getPid(tr) {
+                        var firstTd = tr.querySelector('td');
+                        if (!firstTd) return null;
+                        var slot = firstTd.querySelector('slot');
+                        if (slot) {
+                            var assigned = slot.assignedElements();
+                            if (assigned.length > 0) {
+                                var text = assigned[0].textContent.trim();
+                                return text;
+                            }
+                        }
+                        return null;
+                    }
+
+                    // Function to highlight a <tr>
+                    function highlight(tr) {
+                        tr.style.setProperty('background-color', bg, 'important');
+                        tr.querySelectorAll('td').forEach(function(td) {
+                            td.style.setProperty('background-color', bg, 'important');
+                        });
+                        var firstTd = tr.querySelector('td');
+                        if (firstTd) firstTd.style.setProperty('box-shadow', bar, 'important');
+                    }
+
+                    // Function to unhighlight a <tr>
+                    function unhighlight(tr) {
+                        tr.style.removeProperty('background-color');
+                        tr.querySelectorAll('td').forEach(function(td) {
+                            td.style.removeProperty('background-color');
+                        });
+                        var firstTd = tr.querySelector('td');
+                        if (firstTd) firstTd.style.removeProperty('box-shadow');
+                    }
+
+                    if (!grid.shadowRoot) {
+                        console.error('[Highlight] Grid has no shadow root');
+                        return;
+                    }
+
+                    // Clear ALL inline styles first (both tbody and tfoot rows)
+                    var allTrs = grid.shadowRoot.querySelectorAll('tr');
+                    allTrs.forEach(function(tr) { unhighlight(tr); });
+
+                    // Apply highlight to matching tbody rows
+                    var tbody = grid.shadowRoot.querySelector('tbody');
+                    if (!tbody) {
+                        console.error('[Highlight] No tbody found');
+                        return;
+                    }
+
+                    var bodyRows = tbody.querySelectorAll('tr');
+                    var styledCount = 0;
+
+                    bodyRows.forEach(function(tr) {
+                        var pid = getPid(tr);
+                        if (pid !== null && hlPids[pid]) {
+                            highlight(tr);
+                            styledCount++;
+                        }
+                    });
+
+                    console.log('[Highlight] Applied: ' + styledCount + '/' + bodyRows.length +
+                        ' rows (PIDs to highlight: ' + hlCount + ', dark=' + isDark + ')');
+
+                    // MutationObserver for virtual scrolling - style new rows as they appear
+                    if (tbody._hlObserver) tbody._hlObserver.disconnect();
+                    tbody._hlObserver = new MutationObserver(function(mutations) {
+                        mutations.forEach(function(m) {
+                            m.addedNodes.forEach(function(node) {
+                                if (node.nodeName === 'TR') {
+                                    var pid = getPid(node);
+                                    if (pid !== null && hlPids[pid]) {
+                                        highlight(node);
+                                    }
+                                }
+                            });
+                        });
+                    });
+                    tbody._hlObserver.observe(tbody, { childList: true });
+                })();
+                """,
+                    activityGrid.getElement(), isDark, pidList
+            );
+        });
+    }
 
     @Override
     protected void onAttach(AttachEvent attachEvent) {
         super.onAttach(attachEvent);
-        UI.getCurrent().getPage().executeJs("const u=document.querySelector('vaadin-upload'); if(u) u.shadowRoot.querySelector('vaadin-upload-file-list').style.display='none'");
+        UI.getCurrent().getPage().executeJs(
+                "const u=document.querySelector('vaadin-upload');" +
+                        "if(u) u.shadowRoot.querySelector('vaadin-upload-file-list').style.display='none';"
+        );
     }
 
     @PreDestroy
