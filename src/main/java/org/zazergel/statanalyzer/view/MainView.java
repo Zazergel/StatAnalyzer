@@ -19,6 +19,7 @@ import com.vaadin.flow.component.textfield.IntegerField;
 import com.vaadin.flow.data.renderer.ComponentRenderer;
 import com.vaadin.flow.data.renderer.LitRenderer;
 import com.vaadin.flow.data.renderer.Renderer;
+import lombok.extern.slf4j.Slf4j;
 import com.vaadin.flow.dom.ThemeList;
 import com.vaadin.flow.router.Route;
 import com.vaadin.flow.theme.lumo.Lumo;
@@ -47,6 +48,7 @@ import java.util.stream.Collectors;
 @Route("")
 @Uses(Icon.class)
 @Uses(Span.class)
+@Slf4j
 public class MainView extends VerticalLayout {
 
     private final StatisticsService statisticsService;
@@ -78,6 +80,7 @@ public class MainView extends VerticalLayout {
     private String activeLockFilter = null;
 
     private int highlightThresholdMillis = 60000;
+    private java.util.Set<Integer> highlightPidsSet = java.util.Set.of();
 
     public MainView(IngestService ingestService,
                     StatisticsService statisticsService,
@@ -124,6 +127,7 @@ public class MainView extends VerticalLayout {
         } else {
             themeList.add(Lumo.DARK);
         }
+        applyHighlightJS();
     }
 
     private void onSearch(String filter) {
@@ -387,8 +391,11 @@ public class MainView extends VerticalLayout {
                     .filter(row -> activeStateFilter.equals(row.get("state")))
                     .collect(Collectors.toList());
         }
+
+        this.highlightPidsSet = computeHighlightPids(currentActivityData);
+
         activityGrid.setItems(itemsToSet);
-        applyHighlightStyles();
+        applyHighlightJS();
     }
 
     private void updateLocksGridItems() {
@@ -512,6 +519,15 @@ public class MainView extends VerticalLayout {
                 .setAutoWidth(true).setFlexGrow(1).setResizable(true);
 
         activityGrid.addItemDoubleClickListener(e -> showQueryDialog((String) e.getItem().get("query"), null));
+
+        activityGrid.setClassNameGenerator(row -> {
+            if (highlightPidsSet.isEmpty()) return null;
+            Object pidObj = row.get("pid");
+            if (pidObj instanceof Number n && highlightPidsSet.contains(n.intValue())) {
+                return "slow-request";
+            }
+            return null;
+        });
     }
 
     private void configureLocksGrid() {
@@ -741,7 +757,7 @@ public class MainView extends VerticalLayout {
         separator.getStyle().set("margin", "var(--lumo-space-m) 0");
         layout.add(separator);
 
-        Span thresholdLabel = new Span("Порог подсветки (TX Start vs Timeline):");
+        Span thresholdLabel = new Span("Минимальная длительность slow query:");
         thresholdLabel.getStyle().set("font-weight", "bold");
         layout.add(thresholdLabel);
 
@@ -882,28 +898,31 @@ public class MainView extends VerticalLayout {
     }
 
     /**
-     * Applies row highlight styles based on TX Start vs snapshot timestamp.
-     * Computes the set of highlighted PIDs server-side, passes them to JS,
-     * then JS reads each row's PID from the first cell's slotted content
-     * and applies inline styles accordingly.
+     * Computes the set of PIDs whose TX START is earlier than the selected
+     * timeline time minus the configured threshold. Rows with NULL, blank,
+     * or epoch-zero TX START are excluded.
      */
-    private void applyHighlightStyles() {
-        if (lastLoadedSnapshot == null || currentActivityData == null) return;
+    private java.util.Set<Integer> computeHighlightPids(List<Map<String, Object>> rows) {
+        if (lastLoadedSnapshot == null || rows == null) return java.util.Set.of();
 
         long snapshotTimeMillis = resolveSnapshotMillis();
-        if (snapshotTimeMillis < 0) return;
+        if (snapshotTimeMillis < 0) {
+            log.warn("[Highlight] resolveSnapshotMillis returned -1, keys in snapshot: {}",
+                    lastLoadedSnapshot.keySet());
+            return java.util.Set.of();
+        }
 
         int offset = toolbar.getTimezoneOffset() != null ? toolbar.getTimezoneOffset() : 0;
 
-        // Compute set of PIDs that should be highlighted
-        java.util.Set<Integer> highlightPids = new java.util.HashSet<>();
-        int diagCount = 0;
-        for (Map<String, Object> row : currentActivityData) {
+        java.util.Set<Integer> pids = new java.util.HashSet<>();
+        int nullTxCount = 0;
+        for (Map<String, Object> row : rows) {
             try {
                 Object txStartObj = row.get("xact_start");
-                if (txStartObj == null) continue;
+                if (txStartObj == null) { nullTxCount++; continue; }
+                if (txStartObj instanceof String s && s.isBlank()) continue;
                 long txStartMillis = toMillis(txStartObj);
-                if (txStartMillis < 0) continue;
+                if (txStartMillis <= 0) continue;
                 long adjustedTxStart = txStartMillis + (offset * 3600000L);
 
                 // Compare DISPLAYED times only (time-of-day, no dates).
@@ -919,143 +938,84 @@ public class MainView extends VerticalLayout {
                 if (diff < 0) diff += 86400000L; // midnight wrap-around
                 if (diff > 43200000L) diff = 0;  // >12h means TX is after timeline
 
-                // Diagnostic: log first 2 rows
-                if (diagCount < 2) {
-                    diagCount++;
-                    System.err.println("[HL-DIAG] row#" + diagCount
-                            + " snap_epoch=" + snapshotTimeMillis
-                            + " snap_tod=" + snapTimeOfDay
-                            + " (" + (snapTimeOfDay/3600000) + "h" + ((snapTimeOfDay%3600000)/60000) + "m)"
-                            + " tx_epoch=" + txStartMillis
-                            + " tx_tod=" + txTimeOfDay
-                            + " (" + (txTimeOfDay/3600000) + "h" + ((txTimeOfDay%3600000)/60000) + "m)"
-                            + " sys_tz_offset=" + (systemOffsetMs/3600000) + "h"
-                            + " user_offset=" + offset
-                            + " diff=" + diff + "ms"
-                            + " threshold=" + highlightThresholdMillis + "ms"
-                            + " => " + (diff > highlightThresholdMillis ? "HIGHLIGHT" : "skip")
-                            + " pid=" + row.get("pid"));
-                }
-
                 if (diff > highlightThresholdMillis) {
                     Object pidObj = row.get("pid");
                     if (pidObj instanceof Number) {
-                        highlightPids.add(((Number) pidObj).intValue());
+                        pids.add(((Number) pidObj).intValue());
                     }
                 }
             } catch (Exception ignored) { }
         }
-        System.err.println("[HL-DIAG] Total highlighted PIDs: " + highlightPids.size()
-                + " of " + currentActivityData.size() + " rows (threshold="
-                + formatThreshold(highlightThresholdMillis) + ", offset=" + offset + ")");
+        log.info("[Highlight] result: {} highlighted PIDs of {} rows ({} null xact_start), " +
+                        "threshold={}ms, snapshot_epoch={}, offset={}h",
+                pids.size(), rows.size(), nullTxCount,
+                highlightThresholdMillis, snapshotTimeMillis, offset);
+        return pids;
+    }
 
-        String pidList = highlightPids.stream()
+    /**
+     * Applies inline highlight styles to grid rows by reading each row's
+     * PID from its item data and checking against the computed highlight set.
+     * Uses a MutationObserver to handle virtual scroll row recycling.
+     */
+    private void applyHighlightJS() {
+        String pidList = highlightPidsSet.stream()
                 .map(String::valueOf)
                 .collect(java.util.stream.Collectors.joining(","));
 
         boolean isDark = UI.getCurrent().getElement().getThemeList().contains(Lumo.DARK);
+        String bg = isDark ? "rgba(255,82,82,0.18)" : "rgba(244,67,54,0.12)";
+        String bar = isDark ? "rgba(255,82,82,0.55)" : "rgba(244,67,54,0.7)";
 
-        UI.getCurrent().beforeClientResponse(activityGrid, ctx -> {
-            activityGrid.getElement().executeJs("""
+        activityGrid.getElement().executeJs("""
                 (function() {
-                    var grid = $0;
-                    var isDark = $1;
-                    var pidStr = $2;
-                    var bg = isDark ? 'rgba(255,82,82,0.18)' : 'rgba(244,67,54,0.12)';
-                    var bar = isDark ? 'inset 3px 0 0 0 rgba(255,82,82,0.55)' : 'inset 3px 0 0 0 rgba(244,67,54,0.7)';
-
-                    // Build set of highlighted PIDs
+                    var grid = this;
                     var hlPids = {};
+                    var pidStr = $0;
                     if (pidStr) {
                         pidStr.split(',').forEach(function(p) { hlPids[p.trim()] = true; });
                     }
-                    var hlCount = Object.keys(hlPids).length;
+                    var bg = $1;
+                    var bar = $2;
 
-                    // Function to read PID from a <tr>'s first cell
-                    function getPid(tr) {
-                        var firstTd = tr.querySelector('td');
-                        if (!firstTd) return null;
-                        var slot = firstTd.querySelector('slot');
-                        if (slot) {
-                            var assigned = slot.assignedElements();
-                            if (assigned.length > 0) {
-                                var text = assigned[0].textContent.trim();
-                                return text;
-                            }
-                        }
-                        return null;
-                    }
-
-                    // Function to highlight a <tr>
-                    function highlight(tr) {
-                        tr.style.setProperty('background-color', bg, 'important');
-                        tr.querySelectorAll('td').forEach(function(td) {
-                            td.style.setProperty('background-color', bg, 'important');
-                        });
-                        var firstTd = tr.querySelector('td');
-                        if (firstTd) firstTd.style.setProperty('box-shadow', bar, 'important');
-                    }
-
-                    // Function to unhighlight a <tr>
-                    function unhighlight(tr) {
-                        tr.style.removeProperty('background-color');
-                        tr.querySelectorAll('td').forEach(function(td) {
-                            td.style.removeProperty('background-color');
-                        });
-                        var firstTd = tr.querySelector('td');
-                        if (firstTd) firstTd.style.removeProperty('box-shadow');
-                    }
-
-                    if (!grid.shadowRoot) {
-                        console.error('[Highlight] Grid has no shadow root');
-                        return;
-                    }
-
-                    // Clear ALL inline styles first (both tbody and tfoot rows)
-                    var allTrs = grid.shadowRoot.querySelectorAll('tr');
-                    allTrs.forEach(function(tr) { unhighlight(tr); });
-
-                    // Apply highlight to matching tbody rows
-                    var tbody = grid.shadowRoot.querySelector('tbody');
-                    if (!tbody) {
-                        console.error('[Highlight] No tbody found');
-                        return;
-                    }
-
-                    var bodyRows = tbody.querySelectorAll('tr');
-                    var styledCount = 0;
-
-                    bodyRows.forEach(function(tr) {
-                        var pid = getPid(tr);
-                        if (pid !== null && hlPids[pid]) {
-                            highlight(tr);
-                            styledCount++;
-                        }
-                    });
-
-                    console.log('[Highlight] Applied: ' + styledCount + '/' + bodyRows.length +
-                        ' rows (PIDs to highlight: ' + hlCount + ', dark=' + isDark + ')');
-
-                    // MutationObserver for virtual scrolling - style new rows as they appear
-                    if (tbody._hlObserver) tbody._hlObserver.disconnect();
-                    tbody._hlObserver = new MutationObserver(function(mutations) {
-                        mutations.forEach(function(m) {
-                            m.addedNodes.forEach(function(node) {
-                                if (node.nodeName === 'TR') {
-                                    var pid = getPid(node);
-                                    if (pid !== null && hlPids[pid]) {
-                                        highlight(node);
-                                    }
-                                }
+                    function styleRow(tr) {
+                        var tds = tr.querySelectorAll('td');
+                        if (!tds.length) return;
+                        var isHighlighted = tr._item
+                            && tr._item.style
+                            && tr._item.style.row
+                            && tr._item.style.row.indexOf('slow-request') !== -1;
+                        if (isHighlighted) {
+                            tds.forEach(function(td) {
+                                td.style.setProperty('background-color', bg, 'important');
                             });
+                            tds[0].style.setProperty('box-shadow', 'inset 3px 0 0 0 ' + bar, 'important');
+                        } else {
+                            tds.forEach(function(td) {
+                                td.style.removeProperty('background-color');
+                            });
+                            tds[0].style.removeProperty('box-shadow');
+                        }
+                    }
+                    function styleAllRows() {
+                        if (!grid.$ || !grid.$.items) return;
+                        var rows = grid.$.items.children;
+                        for (var i = 0; i < rows.length; i++) {
+                            styleRow(rows[i]);
+                        }
+                    }
+                    requestAnimationFrame(function() {
+                        requestAnimationFrame(styleAllRows);
+                        if (grid._hlObserver) grid._hlObserver.disconnect();
+                        grid._hlObserver = new MutationObserver(function() {
+                            requestAnimationFrame(styleAllRows);
                         });
+                        if (grid.$.items) {
+                            grid._hlObserver.observe(grid.$.items, { childList: true });
+                        }
                     });
-                    tbody._hlObserver.observe(tbody, { childList: true });
-                })();
-                """,
-                    activityGrid.getElement(), isDark, pidList
-            );
-        });
+                }).call(this);
+                """, pidList, bg, bar);
     }
 
     @Override
@@ -1065,6 +1025,7 @@ public class MainView extends VerticalLayout {
                 "const u=document.querySelector('vaadin-upload');" +
                         "if(u) u.shadowRoot.querySelector('vaadin-upload-file-list').style.display='none';"
         );
+        applyHighlightJS();
     }
 
     @PreDestroy
