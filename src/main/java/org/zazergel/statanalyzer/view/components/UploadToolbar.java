@@ -310,6 +310,7 @@ public class UploadToolbar extends FlexLayout {
 
         UI ui = UI.getCurrent();
         uploadStartTime.set(Instant.now());
+        AtomicInteger fileCount = new AtomicInteger(0);
 
         ui.access(() -> {
             progressBar.setVisible(true);
@@ -322,37 +323,34 @@ public class UploadToolbar extends FlexLayout {
             ui.push();
         });
 
-        scheduler.scheduleAtFixedRate(() -> {
+        java.util.concurrent.ScheduledFuture<?> progressTask = scheduler.scheduleAtFixedRate(() -> {
             Instant start = uploadStartTime.get();
             if (start != null) {
                 long secondsElapsed = Duration.between(start, Instant.now()).getSeconds();
-                if (secondsElapsed > 5) {
-                    ui.access(() -> {
-                        statusLabel.setText(String.format("Парсинг... (%d сек)", secondsElapsed));
-                        ui.push();
-                    });
-                }
+                int files = fileCount.get();
+                String text = secondsElapsed > 5
+                        ? String.format("Парсинг... (%d сек, %d файлов)", secondsElapsed, files)
+                        : String.format("Загрузка... (%d файлов)", files);
+                ui.access(() -> {
+                    statusLabel.setText(text);
+                    ui.push();
+                });
             }
         }, 1, 1, TimeUnit.SECONDS);
 
         executor.submit(() -> {
             try {
-                AtomicInteger fileCount = new AtomicInteger(0);
-                ingestService.ingestLocalPath(path, currentTimezoneOffset, cnt -> {
-                    int current = fileCount.addAndGet(cnt);
-                    ui.access(() -> {
-                        statusLabel.setText("Обработано " + current + " файлов...");
-                        ui.push();
-                    });
-                });
+                ingestService.ingestLocalPath(path, currentTimezoneOffset, fileCount::addAndGet);
 
                 ui.access(() -> {
+                    progressTask.cancel(false);
                     onDataRefresh.run();
                     uploadStartTime.set(null);
                     ui.push();
                 });
             } catch (Exception e) {
                 ui.access(() -> {
+                    progressTask.cancel(false);
                     progressBar.setVisible(false);
                     statusLabel.setText("Ошибка: " + e.getMessage());
                     statusLabel.getStyle().set("color", "var(--lumo-error-color)");

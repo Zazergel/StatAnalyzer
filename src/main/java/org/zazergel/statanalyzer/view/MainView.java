@@ -75,6 +75,8 @@ public class MainView extends VerticalLayout {
 
     private List<Map<String, Object>> currentActivityData = List.of();
     private List<Map<String, Object>> currentLocksData = List.of();
+    private List<Map<String, Object>> currentRootCauseData = List.of();
+    private final Set<Tab> pendingGrids = new HashSet<>();
 
     private String activeStateFilter = null;
     private String activeLockFilter = null;
@@ -137,10 +139,12 @@ public class MainView extends VerticalLayout {
 
     private void onTimezoneChanged(Integer offset) {
         if (activityGrid.isVisible()) {
+            pendingGrids.remove(tabActivity);
             updateActivityGridItems();
         }
         if (rootCauseGrid.isVisible()) {
-            rootCauseGrid.getDataProvider().refreshAll();
+            pendingGrids.remove(tabAnalysis);
+            rootCauseGrid.setItems(currentRootCauseData);
         }
     }
 
@@ -162,6 +166,8 @@ public class MainView extends VerticalLayout {
             this.currentSnapshotId = null;
             this.activeStateFilter = null;
             this.activeLockFilter = null;
+            this.currentRootCauseData = List.of();
+            pendingGrids.clear();
 
             activityGrid.setItems(List.of());
             locksGrid.setItems(List.of());
@@ -188,6 +194,12 @@ public class MainView extends VerticalLayout {
     private VerticalLayout createWorkspace() {
         tabs.addThemeVariants(TabsVariant.LUMO_SMALL);
         tabs.addSelectedChangeListener(e -> {
+            Tab selected = e.getSelectedTab();
+            if (pendingGrids.remove(selected)) {
+                if (selected.equals(tabActivity)) updateActivityGridItems();
+                else if (selected.equals(tabLocks)) updateLocksGridItems();
+                else if (selected.equals(tabAnalysis)) rootCauseGrid.setItems(currentRootCauseData);
+            }
             updateGridVisibility();
             updateStatsPanel();
         });
@@ -249,18 +261,30 @@ public class MainView extends VerticalLayout {
 
         this.currentActivityData = statisticsService.getActivity(snapId, currentSearchFilter);
         this.currentLocksData = lockCount > 0 ? statisticsService.getLocks(snapId, currentSearchFilter) : List.of();
-        List<Map<String, Object>> rootCauseData = lockCount > 0 ? statisticsService.getRootCause(snapId, currentSearchFilter) : List.of();
+        this.currentRootCauseData = lockCount > 0 ? statisticsService.getRootCause(snapId, currentSearchFilter) : List.of();
 
         tabActivity.setLabel("Activity (" + currentActivityData.size() + ")");
         tabLocks.setLabel("Locks (" + currentLocksData.size() + ")");
-        tabAnalysis.setLabel("Root Cause Analysis (" + rootCauseData.size() + ")");
+        tabAnalysis.setLabel("Root Cause Analysis (" + currentRootCauseData.size() + ")");
 
-        manageTabsVisibility(!currentActivityData.isEmpty(), !currentLocksData.isEmpty(), !rootCauseData.isEmpty());
+        manageTabsVisibility(!currentActivityData.isEmpty(), !currentLocksData.isEmpty(), !currentRootCauseData.isEmpty());
 
-        updateActivityGridItems();
-        updateLocksGridItems();
+        pendingGrids.clear();
+        Tab activeTab = tabs.getSelectedTab();
 
-        rootCauseGrid.setItems(rootCauseData);
+        if (activeTab.equals(tabActivity)) {
+            updateActivityGridItems();
+            pendingGrids.add(tabLocks);
+            pendingGrids.add(tabAnalysis);
+        } else if (activeTab.equals(tabLocks)) {
+            updateLocksGridItems();
+            pendingGrids.add(tabActivity);
+            pendingGrids.add(tabAnalysis);
+        } else {
+            rootCauseGrid.setItems(currentRootCauseData);
+            pendingGrids.add(tabActivity);
+            pendingGrids.add(tabLocks);
+        }
 
         updateGridVisibility();
         updateStatsPanel();
@@ -365,6 +389,7 @@ public class MainView extends VerticalLayout {
         } else {
             activeStateFilter = state;
         }
+        pendingGrids.remove(tabActivity);
         updateActivityGridItems();
         updateStatsPanel();
     }
@@ -375,6 +400,7 @@ public class MainView extends VerticalLayout {
         } else {
             activeLockFilter = mode;
         }
+        pendingGrids.remove(tabLocks);
         updateLocksGridItems();
         updateStatsPanel();
     }
@@ -516,7 +542,7 @@ public class MainView extends VerticalLayout {
 
         activityGrid.addColumn(createHighlightRenderer("query"))
                 .setHeader("Query").setKey("Query")
-                .setAutoWidth(true).setFlexGrow(1).setResizable(true);
+                .setFlexGrow(1).setResizable(true);
 
         activityGrid.addItemDoubleClickListener(e -> showQueryDialog((String) e.getItem().get("query"), null));
 
@@ -634,7 +660,7 @@ public class MainView extends VerticalLayout {
 
     private Renderer<Map<String, Object>> createHighlightRenderer(String key) {
         return LitRenderer.<Map<String, Object>>of(
-                "<span style='font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; font-size: 12px;' .innerHTML='${item.htmlContent}'></span>"
+                "<span style='font-family: monospace; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; font-size: 12px;' .innerHTML='${item.htmlContent}'></span>"
         ).withProperty("htmlContent", row -> {
             String val = row.get(key) != null ? row.get(key).toString() : "";
             return SqlUtils.highlightHtml(val, true, currentSearchFilter);
@@ -824,10 +850,6 @@ public class MainView extends VerticalLayout {
         return String.format("%dч %dм %dс %dмс", h, m, s, ms);
     }
 
-    // ========================================================================
-    // Row highlighting — timestamp helpers and inline-style application
-    // ========================================================================
-
     /**
      * Converts various timestamp representations to epoch millis.
      * Supports: java.sql.Timestamp, java.time.LocalDateTime, java.time.LocalTime,
@@ -849,7 +871,6 @@ public class MainView extends VerticalLayout {
                 // No date context — use epoch day 0
                 return Timestamp.valueOf(
                         java.time.LocalDate.ofEpochDay(0).atTime(lt)).getTime();
-                // No date context — use epoch day 0
             }
             case Number n -> {
                 return n.longValue();
@@ -946,7 +967,7 @@ public class MainView extends VerticalLayout {
                 }
             } catch (Exception ignored) { }
         }
-        log.info("[Highlight] result: {} highlighted PIDs of {} rows ({} null xact_start), " +
+        log.debug("[Highlight] result: {} highlighted PIDs of {} rows ({} null xact_start), " +
                         "threshold={}ms, snapshot_epoch={}, offset={}h",
                 pids.size(), rows.size(), nullTxCount,
                 highlightThresholdMillis, snapshotTimeMillis, offset);
